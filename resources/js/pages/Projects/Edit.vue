@@ -30,7 +30,7 @@ interface Project {
 const props = defineProps<{
     project: Project;
     availableResources: AvailableResource[];
-    currentResourceId?: number | null; // Passed from controller
+    currentResourceIds?: number[]; // Changed from currentResourceId, expect array
 }>();
 
 const pageTitle = computed(() => `Edit ${props.project.is_task ? 'Task' : 'Project'}: ${props.project.project_name}`);
@@ -69,7 +69,7 @@ function handleCancel() {
             <ProjectForm
                 :project="props.project"
                 :available-resources="props.availableResources"
-                :current-resource-id="props.currentResourceId"
+                :current-resource-ids="props.currentResourceIds"
                 @submit="handleSubmit"
                 @cancel="handleCancel"
                 :form-title="pageTitle"

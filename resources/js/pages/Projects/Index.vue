@@ -144,14 +144,15 @@ function addWorkDays(startDate: Date, days: number): Date {
     return currentDate;
 }
 
-// Function to calculate estimated end date
-function calculateEstimatedEndDate(startDateString: string | null | undefined, estimatedHours: number): string {
-    if (!startDateString || estimatedHours <= 0) return 'N/A';
+// Function to calculate estimated end date - NOW RETURNS Date | null
+function calculateEstimatedEndDateObject(startDateString: string | null | undefined, estimatedHours: number): Date | null {
+    // Ensure hours is a positive number
+    if (!startDateString || !estimatedHours || estimatedHours <= 0) return null;
 
     try {
         const startDate = new Date(startDateString);
         // Check if startDate is valid
-        if (isNaN(startDate.getTime())) return 'Invalid Start Date';
+        if (isNaN(startDate.getTime())) return null; // Return null for invalid date
 
         // Adjust start date if it falls on a weekend
         let startDayOfWeek = startDate.getDay();
@@ -168,16 +169,50 @@ function calculateEstimatedEndDate(startDateString: string | null | undefined, e
 
         // If it takes less than a full day's work (<= 7 hours), the end date is the start date (after weekend adjustment)
         if (workDaysNeeded < 0) {
-            return formatDate(startDate.toISOString().split('T')[0]); // Format adjusted start date
+            return startDate; // Return the adjusted start date object
         }
 
         const endDate = addWorkDays(startDate, workDaysNeeded);
-        return formatDate(endDate.toISOString().split('T')[0]); // Format calculated end date
+        return endDate; // Return the calculated end date object
     } catch (e) {
         console.error('Error calculating end date:', e);
-        return 'Error'; // Indicate calculation error
+        return null; // Return null on error
     }
 }
+
+// New function to format the Date object from calculateEstimatedEndDateObject
+function getFormattedEstimatedEndDate(project: Project): string {
+    const endDate = calculateEstimatedEndDateObject(project.start_date, project.time_estimate_hours);
+    // Use the existing formatDate, but ensure we pass a string in the expected format or null
+    return endDate ? formatDate(endDate.toISOString().split('T')[0]) : 'N/A';
+}
+
+// --- Row Styling Logic ---
+function getRowClass(project: Project): string {
+    const estimatedEndDate = calculateEstimatedEndDateObject(project.start_date, project.time_estimate_hours);
+    const deadline = project.deadline ? new Date(project.deadline) : null;
+
+    // Only apply styling if both dates are valid and project is not completed/archived
+    if (!estimatedEndDate || !deadline || isNaN(deadline.getTime()) || ['completed', 'archived'].includes(project.status)) {
+        return '';
+    }
+
+    // Clear time part for accurate day comparison
+    estimatedEndDate.setHours(0, 0, 0, 0);
+    deadline.setHours(0, 0, 0, 0);
+
+    const timeDiff = deadline.getTime() - estimatedEndDate.getTime();
+    const daysDiff = Math.ceil(timeDiff / (1000 * 3600 * 24)); // Difference in days
+
+    if (daysDiff < 0) {
+        return 'bg-red-50 dark:bg-red-900/30'; // Past deadline
+    } else if (daysDiff <= 3) {
+        return 'bg-yellow-50 dark:bg-yellow-900/30'; // Nearing deadline (3 days or less)
+    }
+
+    return ''; // Default: no special background
+}
+// --- End Row Styling Logic ---
 </script>
 
 <template>
@@ -246,7 +281,7 @@ function calculateEstimatedEndDate(startDateString: string | null | undefined, e
                             </TableRow>
                         </TableHeader>
                         <TableBody>
-                            <TableRow v-for="project in projects.data" :key="project.project_id">
+                            <TableRow v-for="project in projects.data" :key="project.project_id" :class="getRowClass(project)">
                                 <TableCell class="font-medium">{{ project.project_name }}</TableCell>
                                 <TableCell>
                                     <Badge :variant="project.is_task ? 'secondary' : 'default'">
@@ -255,7 +290,7 @@ function calculateEstimatedEndDate(startDateString: string | null | undefined, e
                                 </TableCell>
                                 <TableCell>{{ formatDate(project.start_date) }}</TableCell>
                                 <TableCell>{{ project.time_estimate_hours }}</TableCell>
-                                <TableCell>{{ calculateEstimatedEndDate(project.start_date, project.time_estimate_hours) }}</TableCell>
+                                <TableCell>{{ getFormattedEstimatedEndDate(project) }}</TableCell>
                                 <TableCell>{{ formatDate(project.deadline) }}</TableCell>
                                 <TableCell>
                                     <Badge variant="outline">{{ project.status.replace('_', ' ') }}</Badge>

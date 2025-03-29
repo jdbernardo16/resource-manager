@@ -14,7 +14,7 @@ import { computed, watch } from 'vue';
 interface AvailableResource {
     resource_id: number;
     name: string;
-    is_assigned_elsewhere: boolean; // Added flag
+    is_assigned_elsewhere?: boolean; // Make optional to align with Create.vue
 }
 
 // Define the structure for project data (optional, for editing)
@@ -27,14 +27,14 @@ interface ProjectData {
     is_task: boolean;
     deadline?: string | null; // Add optional deadline
     status: string; // Add status field
-    // Include current resource ID if editing
-    resource_id?: number | null;
+    // Include current resource IDs if editing
+    resource_ids?: number[]; // Changed from resource_id
 }
 
 const props = defineProps<{
     availableResources: AvailableResource[];
     project?: ProjectData | null; // Project data for editing, null for create
-    currentResourceId?: number | null; // Explicitly pass current resource ID for editing default
+    currentResourceIds?: number[]; // Changed from currentResourceId, expect an array
     submitButtonText?: string;
     formTitle?: string;
     formDescription?: string;
@@ -61,8 +61,8 @@ const form = useForm({
     start_date: props.project?.start_date ? new Date(props.project.start_date).toISOString().split('T')[0] : '',
     time_estimate_hours: props.project?.time_estimate_hours ?? 0, // Use 0 as default instead of null
     is_task: props.project?.is_task ?? false,
-    // Use currentResourceId for default selection in edit mode, otherwise null/undefined
-    resource_id: props.currentResourceId ?? null,
+    // Use currentResourceIds for default selection in edit mode, otherwise an empty array
+    resource_ids: props.currentResourceIds ?? [], // Changed to resource_ids (array)
     // Format deadline similarly to start_date, use undefined if null/missing
     deadline: props.project?.deadline ? new Date(props.project.deadline).toISOString().split('T')[0] : undefined,
     status: props.project?.status ?? 'active', // Initialize status, default to 'active'
@@ -86,7 +86,9 @@ const submitText = computed(() => props.submitButtonText ?? (props.project ? 'Up
 
 // Computed property to display the calculated end date
 const displayEstimatedEndDate = computed(() => {
-    return calculateEstimatedEndDate(form.start_date, form.time_estimate_hours);
+    // Pass the number of selected resources to the calculation function
+    const numberOfResources = form.resource_ids.length > 0 ? form.resource_ids.length : 1; // Avoid division by zero if none selected yet
+    return calculateEstimatedEndDate(form.start_date, form.time_estimate_hours, numberOfResources);
 });
 
 // Watch for project prop changes if the component might be reused without unmounting
@@ -99,7 +101,7 @@ watch(
         form.start_date = newProject?.start_date ? new Date(newProject.start_date).toISOString().split('T')[0] : '';
         form.time_estimate_hours = newProject?.time_estimate_hours ?? 0; // Use 0 as default instead of null
         form.is_task = newProject?.is_task ?? false;
-        form.resource_id = props.currentResourceId ?? null; // Use updated currentResourceId
+        form.resource_ids = props.currentResourceIds ?? []; // Use updated currentResourceIds (array)
         form.deadline = newProject?.deadline ? new Date(newProject.deadline).toISOString().split('T')[0] : undefined; // Reset/set deadline (use undefined)
         form.status = newProject?.status ?? 'active'; // Reset/set status
         form._method = newProject ? 'PUT' : 'POST';
@@ -108,13 +110,15 @@ watch(
 );
 
 watch(
-    () => props.currentResourceId,
-    (newResourceId) => {
-        // Update form's resource_id only if it wasn't already set by the project prop watcher
-        if (form.resource_id !== newResourceId) {
-            form.resource_id = newResourceId ?? null;
+    () => props.currentResourceIds,
+    (newResourceIds) => {
+        // Update form's resource_ids only if it wasn't already set by the project prop watcher
+        // Compare arrays by converting to JSON strings for simplicity, or use a deep comparison library
+        if (JSON.stringify(form.resource_ids) !== JSON.stringify(newResourceIds ?? [])) {
+            form.resource_ids = newResourceIds ?? [];
         }
     },
+    { deep: true }, // Add deep watch for array changes
 );
 
 // --- Date Calculation Helpers (copied from Index.vue) ---
@@ -147,10 +151,10 @@ function addWorkDays(startDate: Date, days: number): Date {
     return currentDate;
 }
 
-// Function to calculate estimated end date
-function calculateEstimatedEndDate(startDateString: string | null | undefined, estimatedHours: number): string {
-    // Ensure hours is a positive number
-    if (!startDateString || !estimatedHours || estimatedHours <= 0) return 'N/A';
+// Function to calculate estimated end date, considering number of resources
+function calculateEstimatedEndDate(startDateString: string | null | undefined, estimatedHours: number, numberOfResources: number): string {
+    // Ensure hours is positive and resources is at least 1
+    if (!startDateString || !estimatedHours || estimatedHours <= 0 || numberOfResources <= 0) return 'N/A';
 
     try {
         const startDate = new Date(startDateString);
@@ -165,12 +169,15 @@ function calculateEstimatedEndDate(startDateString: string | null | undefined, e
             startDayOfWeek = startDate.getDay();
         }
 
-        const workHoursPerDay = 7;
-        // Calculate full work days needed. Use Math.ceil to round up.
-        // Subtract 1 because the start date counts as the first day.
-        const workDaysNeeded = Math.ceil(estimatedHours / workHoursPerDay) - 1;
+        const baseWorkHoursPerDay = 7;
+        // Calculate effective work hours per day based on number of resources
+        const effectiveWorkHoursPerDay = baseWorkHoursPerDay * numberOfResources;
 
-        // If it takes less than a full day's work (<= 7 hours), the end date is the start date (after weekend adjustment)
+        // Calculate full work days needed using effective hours. Use Math.ceil to round up.
+        // Subtract 1 because the start date counts as the first day.
+        const workDaysNeeded = Math.ceil(estimatedHours / effectiveWorkHoursPerDay) - 1;
+
+        // If it takes less than a full day's effective work, the end date is the start date (after weekend adjustment)
         if (workDaysNeeded < 0) {
             return formatDate(startDate.toISOString().split('T')[0]); // Format adjusted start date
         }
@@ -204,27 +211,43 @@ function calculateEstimatedEndDate(startDateString: string | null | undefined, e
 
                     <!-- Resource Assignment -->
                     <div class="space-y-2">
-                        <Label for="resource_id">Assign Resource</Label>
-                        <Select v-model="form.resource_id" required>
-                            <SelectTrigger id="resource_id">
-                                <SelectValue placeholder="Select a resource" />
-                            </SelectTrigger>
-                            <SelectContent>
-                                <SelectGroup>
-                                    <SelectLabel>Available Resources</SelectLabel>
-                                    <SelectItem
-                                        v-for="resource in availableResources"
-                                        :key="resource.resource_id"
-                                        :value="resource.resource_id"
-                                        :disabled="resource.is_assigned_elsewhere && resource.resource_id !== props.currentResourceId"
+                        <Label>Assign Resources</Label>
+                        <div class="max-h-40 space-y-2 overflow-y-auto rounded-md border p-2">
+                            <div v-if="availableResources.length === 0" class="text-sm text-muted-foreground">No available resources</div>
+                            <div v-else v-for="resource in availableResources" :key="resource.resource_id" class="flex items-center space-x-2">
+                                <Checkbox
+                                    :id="'resource_' + resource.resource_id"
+                                    :checked="form.resource_ids.includes(resource.resource_id)"
+                                    @update:checked="
+                                        (checked) => {
+                                            if (checked) {
+                                                form.resource_ids.push(resource.resource_id);
+                                            } else {
+                                                form.resource_ids = form.resource_ids.filter((id) => id !== resource.resource_id);
+                                            }
+                                        }
+                                    "
+                                    :disabled="resource.is_assigned_elsewhere === true && !props.currentResourceIds?.includes(resource.resource_id)"
+                                />
+                                <label
+                                    :for="'resource_' + resource.resource_id"
+                                    class="text-sm font-medium leading-none"
+                                    :class="{
+                                        'cursor-not-allowed text-muted-foreground':
+                                            resource.is_assigned_elsewhere === true && !props.currentResourceIds?.includes(resource.resource_id),
+                                    }"
+                                >
+                                    {{ resource.name }}
+                                    <span
+                                        v-if="resource.is_assigned_elsewhere === true && !props.currentResourceIds?.includes(resource.resource_id)"
+                                        class="text-xs text-muted-foreground"
                                     >
-                                        {{ resource.name }}
-                                    </SelectItem>
-                                    <SelectItem v-if="availableResources.length === 0" value="null" disabled> No available resources </SelectItem>
-                                </SelectGroup>
-                            </SelectContent>
-                        </Select>
-                        <InputError :message="form.errors.resource_id" />
+                                        (Assigned elsewhere)</span
+                                    >
+                                </label>
+                            </div>
+                        </div>
+                        <InputError :message="form.errors.resource_ids" />
                     </div>
 
                     <!-- Status Selection -->

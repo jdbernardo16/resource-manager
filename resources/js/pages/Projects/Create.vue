@@ -8,6 +8,7 @@ import { Head, router } from '@inertiajs/vue3';
 interface AvailableResource {
     resource_id: number;
     name: string;
+    is_assigned_elsewhere?: boolean; // Make optional for create page, align with ProjectForm
 }
 
 // Define props passed from ProjectController->create

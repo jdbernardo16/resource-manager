@@ -76,27 +76,20 @@ class ProjectController extends Controller
             'time_estimate_hours' => 'required|integer|min:1',
             'is_task' => 'sometimes|boolean',
             'deadline' => 'nullable|date|after_or_equal:start_date', // Add deadline validation
-            'resource_id' => 'required|exists:resources,resource_id', // Ensure resource exists
+            'resource_ids' => 'required|array|min:1', // Expect an array with at least one ID
+            'resource_ids.*' => 'required|integer|exists:resources,resource_id', // Each ID must exist
         ]);
 
-        $resource = Resource::find($validatedData['resource_id']);
+        // Removed single resource fetch and availability check here - will check in loop
 
-        // --- Resource Availability Check ---
-        if ($resource->isCurrentlyAssigned()) {
-            // Throw validation exception to send error back to the form field
-            throw ValidationException::withMessages([
-                'resource_id' => 'This resource is already assigned to an active project/task.',
-            ]);
-            // Or redirect back with a general error:
-            // return Redirect::back()->withErrors(['resource_id' => 'This resource is already assigned.'])->withInput();
-        }
-
-        // --- End Date Calculation (Basic Weekday Logic) ---
+        // --- End Date Calculation (Considering Multiple Resources) ---
         $startDate = Carbon::parse($validatedData['start_date']);
         $endDate = $startDate->copy();
         $hoursEstimate = $validatedData['time_estimate_hours'];
-        $hoursPerDay = 7; // As per plan
-        $daysNeeded = ceil($hoursEstimate / $hoursPerDay);
+        $numberOfResources = count($validatedData['resource_ids']); // Get number of assigned resources
+        $baseHoursPerDay = 7; // As per plan
+        $effectiveHoursPerDay = $baseHoursPerDay * $numberOfResources; // Calculate effective hours
+        $daysNeeded = ceil($hoursEstimate / $effectiveHoursPerDay); // Calculate days based on effective hours
 
         // Adjust if start date itself is a weekend - start counting from next Monday
         if ($startDate->isWeekend()) {
@@ -129,22 +122,50 @@ class ProjectController extends Controller
                 'time_estimate_hours' => $validatedData['time_estimate_hours'],
                 'is_task' => $validatedData['is_task'] ?? false,
                 'deadline' => $validatedData['deadline'] ?? null, // Add deadline
+                // Status defaults to 'active' via model or migration, or set explicitly if needed
+                // 'status' => 'active',
             ]);
 
-            // Create the assignment
-            ProjectAssignment::create([
-                'project_id' => $project->project_id,
-                'resource_id' => $validatedData['resource_id'],
-                'assignment_start_date' => $startDate, // Use Carbon instance
-                'assignment_end_date' => $endDate, // Use calculated end date
-                'assignment_is_active' => true,
-            ]);
+            $resourceErrors = [];
+            foreach ($validatedData['resource_ids'] as $resourceId) {
+                $resource = Resource::find($resourceId);
+
+                // Check availability for each resource
+                if ($resource && $resource->isCurrentlyAssigned()) {
+                    // Collect errors instead of throwing immediately to report all conflicts
+                    $resourceErrors[$resourceId] = "Resource '{$resource->name}' is already assigned to an active project/task.";
+                } else if ($resource) {
+                    // Create the assignment if available
+                    ProjectAssignment::create([
+                        'project_id' => $project->project_id,
+                        'resource_id' => $resourceId,
+                        'assignment_start_date' => $startDate, // Use Carbon instance
+                        'assignment_end_date' => $endDate, // Use calculated end date
+                        'assignment_is_active' => true, // Assuming new assignments start active
+                    ]);
+                }
+                // If resource wasn't found, the 'exists' validation already handled it.
+            }
+
+            // If any resource was unavailable, rollback and throw validation exception
+            if (!empty($resourceErrors)) {
+                DB::rollBack();
+                // We need to format the errors for the 'resource_ids' field or a general error field
+                // For simplicity, let's use a general error message for now, or target the first error
+                $firstError = reset($resourceErrors); // Get the first error message
+                throw ValidationException::withMessages([
+                    // Target the general field or the specific index if possible (more complex)
+                    'resource_ids' => 'One or more selected resources are already assigned: ' . $firstError,
+                    // Or provide individual errors (requires frontend handling)
+                    // 'resource_ids' => $resourceErrors // This might not display well by default
+                ]);
+            }
 
             // Optional: Add Activity Log entry here later
 
             DB::commit();
 
-            return Redirect::route('projects.index')->with('success', 'Project and assignment created successfully.');
+            return Redirect::route('projects.index')->with('success', 'Project and assignments created successfully.');
 
         } catch (\Exception $e) {
             DB::rollBack();
@@ -173,20 +194,20 @@ class ProjectController extends Controller
          // For simplicity now, just pass the project. Reassignment logic is complex.
          $project->load('assignments.resource'); // Load current assignment if needed
 
-        // Fetch available resources *plus* the currently assigned one (if any)
-        $currentResourceId = $project->assignments()->where('assignment_is_active', true)->first()?->resource_id; // Get ID only if actively assigned
+        // Fetch available resources and identify currently assigned ones
+        $currentResourceIds = $project->assignments()->pluck('resource_id')->toArray(); // Get array of currently assigned resource IDs
         $projectIdToExclude = $project->project_id; // Get the ID of the project being edited
 
-        // Fetch all potentially relevant resources (e.g., all active ones, adjust if needed)
+        // Fetch all potentially relevant resources
         $allResources = Resource::query()
             ->orderBy('name', 'asc')
             ->get(['resource_id', 'name']); // Fetch basic details
 
         // Enhance resources with assignment status
-        $availableResources = $allResources->map(function ($resource) use ($projectIdToExclude, $currentResourceId) {
+        $availableResources = $allResources->map(function ($resource) use ($projectIdToExclude, $currentResourceIds) { // Use currentResourceIds here
             // Check if this resource has an active assignment to a DIFFERENT project
             $isAssignedElsewhere = $resource->assignments()
-                ->where('assignment_is_active', true)
+                ->where('assignment_is_active', true) // Assuming active assignments block availability
                 ->where('project_id', '!=', $projectIdToExclude)
                 ->exists();
 
@@ -199,7 +220,7 @@ class ProjectController extends Controller
         return Inertia::render('Projects/Edit', [
             'project' => $project,
             'availableResources' => $availableResources,
-            'currentResourceId' => $currentResourceId,
+            'currentResourceIds' => $currentResourceIds, // Pass the array
         ]);
     }
 
@@ -216,12 +237,13 @@ class ProjectController extends Controller
            'time_estimate_hours' => 'required|integer|min:1',
            'is_task' => 'sometimes|boolean',
            'deadline' => 'nullable|date|after_or_equal:start_date', // Add deadline validation
-           'resource_id' => 'required|exists:resources,resource_id', // Validate the selected resource ID
+           'resource_ids' => 'required|array|min:1', // Expect an array with at least one ID
+           'resource_ids.*' => 'required|integer|exists:resources,resource_id', // Each ID must exist
            'status' => ['required', 'string', \Illuminate\Validation\Rule::in(['active', 'completed', 'archived', 'on_pause'])], // Add status validation
        ]);
 
-       $newResourceId = $validatedData['resource_id'];
-       $assignmentChanged = false; // Flag to track if assignment needs saving
+       // Get the list of resource IDs submitted in the form
+       $newResourceIds = collect($validatedData['resource_ids'])->map(fn($id) => (int)$id)->unique()->toArray();
 
        DB::beginTransaction();
        try {
@@ -237,69 +259,93 @@ class ProjectController extends Controller
            ]);
            $project->save(); // Save project details first
 
-           // --- Handle Assignment Update ---
-           $assignment = $project->assignments()->first(); // Get the current assignment
+           // --- Handle Assignment Updates ---
+           $existingResourceIds = $project->assignments()->pluck('resource_id')->toArray();
 
-           // Check if resource needs to be changed
-           if ($assignment && $assignment->resource_id != $newResourceId) {
-               // Check availability of the NEW resource (excluding this project)
-               $newResource = Resource::find($newResourceId);
-               if ($newResource->assignments()->where('assignment_is_active', true)->where('project_id', '!=', $project->project_id)->exists()) {
-                   DB::rollBack(); // Rollback before throwing validation exception
-                   throw ValidationException::withMessages(['resource_id' => 'The selected resource is already assigned to another active project/task.']);
-               }
-               // Update resource ID and ensure it's active
-               $assignment->resource_id = $newResourceId;
-               $assignment->assignment_is_active = true; // Ensure active status
+           $idsToAdd = array_diff($newResourceIds, $existingResourceIds);
+           $idsToRemove = array_diff($existingResourceIds, $newResourceIds);
+
+           $assignmentChanged = false; // Flag if any assignment DB operation happens
+           $resourceErrors = [];
+
+           // 1. Remove assignments for resources no longer selected
+           if (!empty($idsToRemove)) {
+               ProjectAssignment::where('project_id', $project->project_id)
+                                ->whereIn('resource_id', $idsToRemove)
+                                ->delete();
                $assignmentChanged = true;
-           } elseif (!$assignment && $newResourceId) {
-                // Handle case where project had no assignment but now gets one (edge case?)
-                // Check availability of the NEW resource
-                $newResource = Resource::find($newResourceId);
-                if ($newResource->assignments()->where('assignment_is_active', true)->exists()) { // Check any active assignment
-                    DB::rollBack();
-                    throw ValidationException::withMessages(['resource_id' => 'The selected resource is already assigned to an active project/task.']);
-                }
-                // Create a new assignment (needs end date calculation)
-                $assignment = new ProjectAssignment([
-                    'project_id' => $project->project_id,
-                    'resource_id' => $newResourceId,
-                    'assignment_is_active' => true, // Assuming it starts active
-                ]);
-                $assignmentChanged = true; // Will need saving and date calculation
            }
 
+           // 2. Add assignments for newly selected resources (check availability first)
+           foreach ($idsToAdd as $resourceId) {
+               $resource = Resource::find($resourceId);
+               // Check if the resource is assigned to *another* active project
+               if ($resource && $resource->assignments()->where('assignment_is_active', true)->where('project_id', '!=', $project->project_id)->exists()) {
+                   $resourceErrors[$resourceId] = "Resource '{$resource->name}' is already assigned to another active project/task.";
+               } elseif ($resource) {
+                   // Calculate end date for the new assignment (using project's dates and total final resources)
+                   $startDate = $project->start_date; // Already a Carbon instance from project fill
+                   $endDate = $startDate->copy();
+                   $hoursEstimate = $project->time_estimate_hours;
+                   $numberOfResources = count($newResourceIds); // Use the count of final intended resources
+                   $baseHoursPerDay = 7;
+                   $effectiveHoursPerDay = $baseHoursPerDay * ($numberOfResources > 0 ? $numberOfResources : 1); // Avoid division by zero
+                   $daysNeeded = ceil($hoursEstimate / $effectiveHoursPerDay);
 
-           // Recalculate end date if needed (dates changed OR assignment was created/changed)
-           if ($assignment && ($project->wasChanged('start_date') || $project->wasChanged('time_estimate_hours') || $assignmentChanged)) {
-                $startDate = $project->start_date; // Already a Carbon instance
-                $endDate = $startDate->copy();
-                $hoursEstimate = $project->time_estimate_hours;
-                $hoursPerDay = 7;
-                $daysNeeded = ceil($hoursEstimate / $hoursPerDay);
+                   if ($startDate->isWeekend()) {
+                       $startDate = $startDate->next(Carbon::MONDAY);
+                       $endDate = $startDate->copy();
+                   }
+                   for ($i = 0; $i < $daysNeeded; $i++) {
+                       if ($endDate->isWeekend()) $endDate->next(Carbon::MONDAY);
+                       $endDate->addDay();
+                       while ($endDate->isWeekend()) $endDate->addDay();
+                   }
 
-                if ($startDate->isWeekend()) {
-                    $startDate = $startDate->next(Carbon::MONDAY);
+                   ProjectAssignment::create([
+                       'project_id' => $project->project_id,
+                       'resource_id' => $resourceId,
+                       'assignment_start_date' => $project->start_date,
+                       'assignment_end_date' => $endDate,
+                       'assignment_is_active' => true, // Assuming new assignments are active
+                   ]);
+                   $assignmentChanged = true;
+               }
+           }
+
+           // 3. Handle errors if any resources were unavailable
+           if (!empty($resourceErrors)) {
+               DB::rollBack();
+               $firstError = reset($resourceErrors);
+               throw ValidationException::withMessages([
+                   'resource_ids' => 'One or more selected resources are already assigned: ' . $firstError,
+               ]);
+           }
+
+           // 4. Recalculate end dates for *existing* assignments if project dates changed
+           // (Only if assignments weren't just added/removed, as those already got calculated)
+           if (!$assignmentChanged && ($project->wasChanged('start_date') || $project->wasChanged('time_estimate_hours'))) {
+                $assignmentsToUpdate = $project->assignments()->whereIn('resource_id', $newResourceIds)->get(); // Get remaining assignments
+                foreach ($assignmentsToUpdate as $assignment) {
+                    // Recalculate end date (using final number of resources)
+                    $startDate = $project->start_date;
                     $endDate = $startDate->copy();
-                }
+                    $hoursEstimate = $project->time_estimate_hours;
+                    $numberOfResources = count($newResourceIds); // Use the final count
+                    $baseHoursPerDay = 7;
+                    $effectiveHoursPerDay = $baseHoursPerDay * ($numberOfResources > 0 ? $numberOfResources : 1);
+                    $daysNeeded = ceil($hoursEstimate / $effectiveHoursPerDay);
 
-                for ($i = 0; $i < $daysNeeded; $i++) {
-                    if ($endDate->isWeekend()) {
-                        $endDate->next(Carbon::MONDAY);
-                    }
-                    $endDate->addDay();
-                    while ($endDate->isWeekend()) {
+                    if ($startDate->isWeekend()) { $startDate = $startDate->next(Carbon::MONDAY); $endDate = $startDate->copy(); }
+                    for ($i = 0; $i < $daysNeeded; $i++) {
+                        if ($endDate->isWeekend()) $endDate->next(Carbon::MONDAY);
                         $endDate->addDay();
+                        while ($endDate->isWeekend()) $endDate->addDay();
                     }
+                    $assignment->assignment_start_date = $project->start_date;
+                    $assignment->assignment_end_date = $endDate;
+                    $assignment->save();
                 }
-                $assignment->assignment_start_date = $project->start_date;
-                $assignment->assignment_end_date = $endDate;
-                $assignmentChanged = true; // Mark as changed if dates were recalculated
-           }
-
-           // Save assignment if it was changed or created
-           if ($assignment && $assignmentChanged) {
-               $assignment->save();
            }
 
            DB::commit();
